@@ -1,22 +1,29 @@
-import streamlit as st
 import argparse
 import logging
 import sys
 import os
 import datetime
-import json
+import pandas as pd
 import csv
 import time
 from dotenv import load_dotenv
+import streamlit as st
 
-from pyflink.table import StreamTableEnvironment, DataTypes
 from pyflink.datastream import StreamExecutionEnvironment, RuntimeExecutionMode
 from pyflink.datastream.connectors.file_system import FileSource, StreamFormat, FileSink, OutputFileConfig, RollingPolicy
 from pyflink.datastream.formats.csv import CsvReaderFormat, CsvSchema
 from pyflink.common.watermark_strategy import WatermarkStrategy
 from pyflink.common.serialization import Encoder
+from pyflink.common.types import Row
 from pyflink.datastream.formats.csv import CsvBulkWriters
 from pyflink.datastream import SinkFunction
+
+from pyflink.table import StreamTableEnvironment, DataTypes
+from pyflink.common import Row
+from pyflink.table import (EnvironmentSettings, TableEnvironment, TableDescriptor, Schema,
+                           DataTypes, FormatDescriptor, Table)
+from pyflink.table.expressions import lit, col
+from pyflink.table.udf import udf, udtf
 
 from datetime import timedelta
 from couchbase.auth import PasswordAuthenticator
@@ -39,9 +46,25 @@ from sklearn.neighbors import NearestNeighbors
 from scipy.stats import linregress
 #from yellowbrick.cluster import KElbowVisualizer, SilhouetteVisualizer
 
-def openDataSet(): 
-    #open example dataset with 100 rows
-    data_Path = 'Data/Online Retail.csv'
+
+@udtf(result_types=[DataTypes.INT(), DataTypes.INT(), DataTypes.INT()])
+def splitInvoiceDate(x): 
+    temp = x.split(' ')[0]
+    month = int(temp.split('/')[0])
+    day = int(temp.split('/')[1])
+    year = int(temp.split('/')[2])
+    
+    return [Row(day,month,year)]
+
+@udtf(result_types=[DataTypes.FLOAT()])
+def calculateVenue(quantity, unitprice): 
+    
+    venue = int(quantity) * unitprice
+    
+    return [Row(venue)]
+
+
+def openDataSet(dataPath): 
 
     # Create the corresponding StreamExecutionEnvironment
     env = StreamExecutionEnvironment.get_execution_environment()
@@ -64,7 +87,7 @@ def openDataSet():
             .set_strict_headers() \
             .build()
             
-    source = FileSource.for_record_stream_format(CsvReaderFormat.for_schema(schema), data_Path).build()
+    source = FileSource.for_record_stream_format(CsvReaderFormat.for_schema(schema), dataPath).build()
     ds = env.from_source(source, WatermarkStrategy.no_watermarks(), 'csv-source')
     return ds, env
 
@@ -84,13 +107,14 @@ def sink(ds,outputPath):
         .set_use_header(use = False) \
         .build()
         
+
     sink = FileSink \
-    .for_bulk_format(outputPath, CsvBulkWriters.for_schema(schemaOutput))\
-    .with_output_file_config(
-            OutputFileConfig.builder()
-            .with_part_suffix(".csv")
-            .build())\
-    .build()
+        .for_bulk_format(outputPath, CsvBulkWriters.for_schema(schemaOutput))\
+        .with_output_file_config(
+                OutputFileConfig.builder()
+                .with_part_suffix(".csv")
+                .build())\
+        .build()
         
     ds.sink_to(sink)
     
@@ -172,8 +196,8 @@ def insertToCouchBase(coll, filePath):
                     "quantity": int(row[3]),
                     "invoiceDate": row[4],
                     "unitPrice": float(row[5]),
-                    "customerId": row(row[6]),
-                    "county": row[7]
+                    "customerId": int(row[6]),
+                    "country": row[7]
                 }
                 
                 key = row[0] + "_" + row[1]
@@ -182,7 +206,18 @@ def insertToCouchBase(coll, filePath):
                 print(result.cas)
         except Exception as e:
             print(e)
-            
+
+def getAllFromCouchBase(scope):
+    query = f'SELECT * FROM raw_data'
+
+    row_iter = scope.query(query)
+
+    result = []
+    
+    for row in row_iter:
+        result.append(row['raw_data'])
+        
+    return result
     
 def plot_missing_percentage(df: pd.DataFrame):
     missing_data = df.isna().sum()
@@ -227,6 +262,124 @@ def print_top_frequent(df: pd.DataFrame, column: str, num: int = 5):
     plt.gca().invert_yaxis()
     st.pyplot(plt)
 
+def openDataSetTable(inputPath) -> Table:
+    
+    t_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+    # write all the data to one file
+    t_env.get_config().set("parallelism.default", "1")
+    
+    t_env.create_temporary_table(
+        'source',
+        TableDescriptor.for_connector('filesystem')
+            .schema(Schema.new_builder()
+                    .column('InvoiceNo', DataTypes.STRING())
+                    .column('StockCode', DataTypes.STRING())
+                    .column('Description', DataTypes.STRING())
+                    .column('Quantity', DataTypes.STRING())
+                    .column('InvoiceDate', DataTypes.STRING())
+                    .column('UnitPrice', DataTypes.FLOAT())
+                    .column('CustomerID', DataTypes.STRING())
+                    .column('Country', DataTypes.STRING())
+                    .build())
+            .option('path', inputPath)
+            .format("csv")
+            .build())
+    
+    
+    tab = t_env.from_path('source')
+    res = tab.join_lateral(splitInvoiceDate(col('InvoiceDate')).alias("Day", "Month", "Year")).select(col("*"))
+    return res
+
+def filterData(tab, country, year, month) -> pd.DataFrame:
+    res = tab.filter(col('Country') == country)\
+                .filter(col('Year') == year)\
+                .filter(col('Month') == month)
+                
+    df = res.to_pandas()
+    
+    return df
+
+def getVenuePerMonth(tab, country, year, month) -> pd.DataFrame:
+    res = tab.filter(col('Country') == country)\
+                .filter(col('Year') == year)\
+                .filter(col('Month') == month)\
+                .join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue") )\
+                .select(col('Venue').sum.alias('Total'))
+    df = res.to_pandas()
+    
+    return df
+
+def getListProduct(tab, country, year, month) -> pd.DataFrame:
+    res = tab.filter(col('Country') == country)\
+            .filter(col('Year') == year)\
+            .filter(col('Month') == month)\
+            .join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue"))\
+            .select(col('*'))\
+            .group_by(col('StockCode'), col('Description'))\
+            .select(col('StockCode'), col('Description'), col('Venue').sum.alias("Total"))
+            
+            # .select(col('StockCode'), col('Description'), col('Venue').sum.alias('Total'))
+            
+    df = res.to_pandas()
+    df = df.sort_values(by='Total', ascending=False)
+    
+    # print(df)
+    return df
+
+def getListProdcutTotal(tab) -> pd.DataFrame:
+    res = tab.join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue"))\
+            .select(col('*'))\
+            .group_by(col('Description'))\
+            .select(col('Description'), col('Venue').sum.alias("Total"))
+        
+    df = res.to_pandas()
+    df = df.sort_values(by='Total', ascending=False).iloc[:10]
+    
+    # print(df)
+    return df
+
+def getDailyVenue(tab: Table, country, year, month) -> pd.DataFrame:
+    res = tab.filter(col('Country') == country)\
+        .filter(col('Year') == year)\
+        .filter(col('Month') == month)\
+        .join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue"))\
+        .group_by(col('Day'))\
+        .select(col('Day'), col('Venue').sum.alias('DailyVenue'))
+        
+    df = res.to_pandas()
+    return df
+
+def getCountryList(tab):
+    res = tab.group_by(col('Country')).select(col('Country'))
+    
+    # res.execute().print()
+
+    df = res.to_pandas()
+    
+    countryList = df['Country'].tolist()
+    
+    return countryList
+
+def getCountryCount(tab):
+    res = tab.join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue"))\
+            .group_by(col('Country'))\
+            .select(col('Country'), col('Venue').sum.alias('Total'))
+    
+    df = res.to_pandas()
+    
+    print(df)
+    
+    return df
+
+def getYearlyVenue(tab):
+    res = tab.join_lateral(calculateVenue(col('Quantity'), col('UnitPrice')).alias("Venue"))\
+            .select(col('Venue').sum.alias('YearlyVenue'))
+        
+    df = res.to_pandas()
+    
+    return df
+
+
 # Function to create a radar chart
 def create_radar_chart(ax, angles, data, color, cluster):
     # Plot the data and fill the area
@@ -235,6 +388,7 @@ def create_radar_chart(ax, angles, data, color, cluster):
 
     # Add a title
     ax.set_title(f"Cluster {cluster}", size=20, color=color, y=1.1)
+
 if __name__ == '__main__':
     st.set_page_config(
         page_title="Sales data simple dashboard",
@@ -242,18 +396,31 @@ if __name__ == '__main__':
         layout="wide",
     )
     
+    # st.sidebar.success("Select a demo above.")
+    
     outputPath = './Data/output'
-    ds, env = openDataSet()
+    dataPath = './Data/Online Retail.csv'
+    
+    ds, env = openDataSet(dataPath)
     ds = sink(ds, outputPath)
+    
     env.execute()
 
     time.sleep(10)
 
     file, folder = getLastestFile(outputPath)
     filePath = os.path.join(folder, file)
-    
 
     #scope, bucket, cluster = connectToCouchBase()
+    
+    # coll = scope.collection("raw_data")
+    
+    # insertToCouchBase(coll, filePath)
+    
+    # listDataJSON = getAllFromCouchBase(scope) #listData type is JSON
+    
+    # listData = pd.DataFrame(listDataJSON)
+    # dashboard(listData)
     
     #coll = scope.collection("raw_data")
     
